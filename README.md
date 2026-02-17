@@ -6,6 +6,9 @@ It generates random module graphs, bundles them with Rolldown, and asserts:
 
 - input **static** graph is acyclic
 - output **static chunk-import** graph is also acyclic
+- output chunks contain **valid JavaScript** (parsed with `oxc_parser`)
+- entry chunks **preserve all expected exports** (when `preserveEntrySignatures: "strict"`)
+- output is **deterministic** (bundling twice produces identical results)
 
 When a failure is found, the test prints markdown with:
 
@@ -24,9 +27,22 @@ When a failure is found, the test prints markdown with:
 - `.github/workflows/acyclic_output_fuzz.yml`
   - scheduled fuzz workflow + issue tracking
 
+## Fuzz Tests
+
+| Test | What it checks |
+|------|---------------|
+| `acyclic_input_produces_acyclic_output` | Acyclic input graphs produce acyclic output chunk-import graphs, valid JS, entry export preservation. |
+| `deterministic_output` | Bundling the same graph twice produces identical chunks (filenames, code, imports, exports) |
+
 ## Run Locally
 
-Run the fuzz test:
+Run all fuzz tests:
+
+```bash
+cargo test -p acyclic_output_fuzz -- --nocapture
+```
+
+Run a specific test:
 
 ```bash
 cargo test -p acyclic_output_fuzz acyclic_input_produces_acyclic_output -- --nocapture
@@ -35,13 +51,13 @@ cargo test -p acyclic_output_fuzz acyclic_input_produces_acyclic_output -- --noc
 Increase search space:
 
 ```bash
-PROPTEST_CASES=2000 cargo test -p acyclic_output_fuzz acyclic_input_produces_acyclic_output -- --nocapture
+PROPTEST_CASES=2000 cargo test -p acyclic_output_fuzz -- --nocapture
 ```
 
 Use a deterministic RNG seed:
 
 ```bash
-PROPTEST_RNG_SEED=123456 cargo test -p acyclic_output_fuzz acyclic_input_produces_acyclic_output -- --nocapture
+PROPTEST_RNG_SEED=123456 cargo test -p acyclic_output_fuzz -- --nocapture
 ```
 
 ## Reproduce a Failure

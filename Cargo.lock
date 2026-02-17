@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "flate2",
+ "oxc",
  "proptest",
  "rolldown",
  "rolldown_common",

@@ -6,6 +6,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use oxc::allocator::Allocator as OxcAllocator;
+use oxc::parser::{ParseOptions, Parser};
+use oxc::span::SourceType;
 use proptest::prelude::*;
 use proptest::test_runner::{
     Config as ProptestConfig, RngSeed, TestCaseError, TestError, TestRunner,
@@ -32,6 +35,7 @@ struct GraphCase {
     reexport_static_edges: Vec<(usize, usize)>,
     preserve_entry_signatures: PreserveEntrySignatures,
     strict_execution_order: bool,
+    treeshake: bool,
 }
 
 impl std::fmt::Debug for GraphCase {
@@ -73,15 +77,47 @@ fn acyclic_input_produces_acyclic_output() {
     }
 }
 
+#[test]
+fn deterministic_output() {
+    let mut config = ProptestConfig {
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    };
+    if let Ok(seed_text) = std::env::var("PROPTEST_RNG_SEED") {
+        let seed = seed_text
+            .parse::<u64>()
+            .expect("PROPTEST_RNG_SEED must be a u64");
+        config.rng_seed = RngSeed::Fixed(seed);
+    }
+
+    let mut runner = TestRunner::new(config);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    match runner.run(&acyclic_graph_case_strategy(), |case| {
+        runtime
+            .block_on(run_deterministic_check(case))
+            .map_err(TestCaseError::fail)?;
+        Ok(())
+    }) {
+        Ok(()) => {}
+        Err(TestError::Fail(why, _)) => panic!("{why}"),
+        Err(TestError::Abort(why)) => panic!("Proptest aborted: {why}"),
+    }
+}
+
 fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
     (
         any::<u64>().no_shrink(),
         3usize..=MAX_NODES,
         0u8..4u8,
         any::<bool>(),
+        any::<bool>(),
     )
         .prop_flat_map(
-            |(seed, node_count, preserve_entry_signatures_index, strict_execution_order)| {
+            |(seed, node_count, preserve_entry_signatures_index, strict_execution_order, treeshake)| {
                 let static_edge_slots = node_count * (node_count - 1) / 2;
                 let dynamic_edge_slots = node_count * (node_count - 1);
                 (
@@ -89,6 +125,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                     Just(node_count),
                     Just(preserve_entry_signatures_index),
                     Just(strict_execution_order),
+                    Just(treeshake),
                     prop::collection::vec(any::<bool>(), node_count),
                     prop::collection::vec(any::<bool>(), node_count),
                     prop::collection::vec(any::<bool>(), static_edge_slots),
@@ -103,6 +140,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                 node_count,
                 preserve_entry_signatures_index,
                 strict_execution_order,
+                treeshake,
                 entry_mask,
                 cjs_mask,
                 static_mask,
@@ -114,6 +152,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                     node_count,
                     preserve_entry_signatures_index,
                     strict_execution_order,
+                    treeshake,
                     &entry_mask,
                     &cjs_mask,
                     &static_mask,
@@ -138,6 +177,7 @@ fn build_case_from_masks(
     node_count: usize,
     preserve_entry_signatures_index: u8,
     strict_execution_order: bool,
+    treeshake: bool,
     entry_mask: &[bool],
     cjs_mask: &[bool],
     static_mask: &[bool],
@@ -201,6 +241,7 @@ fn build_case_from_masks(
         reexport_static_edges,
         preserve_entry_signatures,
         strict_execution_order,
+        treeshake,
     }
 }
 
@@ -236,6 +277,7 @@ fn case_from_seed(seed: u64) -> GraphCase {
     let node_count = 3 + (rng.next_u64() as usize % (MAX_NODES - 2));
     let preserve_entry_signatures_index = (rng.next_u64() % 4) as u8;
     let strict_execution_order = rng.next_bool(1, 2);
+    let treeshake = rng.next_bool(1, 2);
 
     let entry_mask = (0..node_count)
         .map(|_| rng.next_bool(1, 2))
@@ -262,12 +304,128 @@ fn case_from_seed(seed: u64) -> GraphCase {
         node_count,
         preserve_entry_signatures_index,
         strict_execution_order,
+        treeshake,
         &entry_mask,
         &cjs_mask,
         &static_mask,
         &dynamic_mask,
         &reexport_mask,
     )
+}
+
+fn validate_output_js_syntax(output: &rolldown::BundleOutput) -> Result<(), String> {
+    for asset in &output.assets {
+        let Output::Chunk(chunk) = asset else {
+            continue;
+        };
+        let allocator = OxcAllocator::default();
+        let source_type = SourceType::mjs();
+        let ret = Parser::new(&allocator, &chunk.code, source_type)
+            .with_options(ParseOptions {
+                allow_return_outside_function: true,
+                ..ParseOptions::default()
+            })
+            .parse();
+        if ret.panicked || !ret.errors.is_empty() {
+            let errors_str = ret
+                .errors
+                .iter()
+                .map(|e| e.clone().with_source_code(chunk.code.clone()).to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(format!(
+                "Syntax error in output chunk '{}':\n{}",
+                chunk.filename, errors_str
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compute_expected_exports(case: &GraphCase, node_index: usize) -> Vec<String> {
+    let is_cjs = is_cjs_node(case, node_index);
+    if is_cjs {
+        // CJS modules get wrapped; their exports are opaque to the bundler
+        return Vec::new();
+    }
+
+    let reexport_set: HashSet<(usize, usize)> =
+        case.reexport_static_edges.iter().copied().collect();
+    let mut exports = Vec::new();
+    exports.push(format!("node_{node_index}"));
+
+    for &(from, to) in &case.static_edges {
+        if from != node_index {
+            continue;
+        }
+        if reexport_set.contains(&(from, to)) && !is_cjs_node(case, to) {
+            exports.push(format!("reexport_{from}_{to}"));
+        } else {
+            exports.push(format!("use_{from}_{to}"));
+        }
+    }
+
+    exports.sort();
+    exports
+}
+
+fn validate_entry_exports(
+    case: &GraphCase,
+    output: &rolldown::BundleOutput,
+) -> Result<(), String> {
+    if !matches!(
+        case.preserve_entry_signatures,
+        PreserveEntrySignatures::Strict
+    ) {
+        return Ok(());
+    }
+
+    let entry_set: HashSet<usize> = case.entry_nodes.iter().copied().collect();
+    for asset in &output.assets {
+        let Output::Chunk(chunk) = asset else {
+            continue;
+        };
+        if !chunk.is_entry {
+            continue;
+        }
+        let facade_id = match &chunk.facade_module_id {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+
+        // Find which input node this entry chunk corresponds to
+        let node_index = case
+            .entry_nodes
+            .iter()
+            .copied()
+            .find(|&idx| {
+                entry_set.contains(&idx) && facade_id.ends_with(&module_filename(case, idx))
+            });
+        let Some(node_index) = node_index else {
+            continue;
+        };
+
+        let expected = compute_expected_exports(case, node_index);
+        if expected.is_empty() {
+            continue;
+        }
+
+        let actual: HashSet<String> = chunk.exports.iter().map(|e| e.to_string()).collect();
+        let mut missing = Vec::new();
+        for exp in &expected {
+            if !actual.contains(exp) {
+                missing.push(exp.clone());
+            }
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "Entry chunk '{}' (node {}) is missing exports: {:?}\nExpected: {:?}\nActual: {:?}",
+                chunk.filename, node_index, missing, expected, actual
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_case(case: GraphCase) -> Result<(), String> {
@@ -322,8 +480,115 @@ async fn run_case(case: GraphCase) -> Result<(), String> {
         ));
     }
 
+    validate_output_js_syntax(&output)?;
+    if !case.treeshake {
+        validate_entry_exports(&case, &output)?;
+    }
+
     std::fs::remove_dir_all(&fixture_dir).map_err(|err| err.to_string())?;
     Ok(())
+}
+
+async fn run_deterministic_check(case: GraphCase) -> Result<(), String> {
+    if graph_cycle_checker::find_cycle(case.node_count, &case.static_edges).is_some() {
+        // Skip cyclic inputs (shouldn't happen but guard anyway)
+        return Ok(());
+    }
+
+    let fixture_dir = create_fixture_dir(case.seed).map_err(|err| err.to_string())?;
+    materialize_graph_modules(&fixture_dir, &case).map_err(|err| err.to_string())?;
+    let options = bundler_options_for_case(&case, fixture_dir.clone());
+
+    let output_a = {
+        let mut bundler = Bundler::new(options.clone()).map_err(|err| err.to_string())?;
+        bundler.generate().await.map_err(|err| err.to_string())?
+    };
+
+    let output_b = {
+        let mut bundler = Bundler::new(options.clone()).map_err(|err| err.to_string())?;
+        bundler.generate().await.map_err(|err| err.to_string())?
+    };
+
+    let chunks_a = collect_chunk_info(&output_a);
+    let chunks_b = collect_chunk_info(&output_b);
+
+    if chunks_a.len() != chunks_b.len() {
+        std::fs::remove_dir_all(&fixture_dir).ok();
+        return Err(format!(
+            "Nondeterministic output: first run produced {} chunks, second run produced {} chunks (seed {})",
+            chunks_a.len(),
+            chunks_b.len(),
+            case.seed,
+        ));
+    }
+
+    for (a, b) in chunks_a.iter().zip(chunks_b.iter()) {
+        if a.filename != b.filename {
+            std::fs::remove_dir_all(&fixture_dir).ok();
+            return Err(format!(
+                "Nondeterministic output: chunk filenames differ: '{}' vs '{}' (seed {})",
+                a.filename, b.filename, case.seed,
+            ));
+        }
+        if a.code != b.code {
+            std::fs::remove_dir_all(&fixture_dir).ok();
+            return Err(format!(
+                "Nondeterministic output: code differs for chunk '{}' (seed {})",
+                a.filename, case.seed,
+            ));
+        }
+        if a.imports != b.imports {
+            std::fs::remove_dir_all(&fixture_dir).ok();
+            return Err(format!(
+                "Nondeterministic output: imports differ for chunk '{}' (seed {})",
+                a.filename, case.seed,
+            ));
+        }
+        if a.exports != b.exports {
+            std::fs::remove_dir_all(&fixture_dir).ok();
+            return Err(format!(
+                "Nondeterministic output: exports differ for chunk '{}' (seed {})",
+                a.filename, case.seed,
+            ));
+        }
+        if a.dynamic_imports != b.dynamic_imports {
+            std::fs::remove_dir_all(&fixture_dir).ok();
+            return Err(format!(
+                "Nondeterministic output: dynamic_imports differ for chunk '{}' (seed {})",
+                a.filename, case.seed,
+            ));
+        }
+    }
+
+    std::fs::remove_dir_all(&fixture_dir).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+struct ChunkInfo {
+    filename: String,
+    code: String,
+    imports: Vec<String>,
+    exports: Vec<String>,
+    dynamic_imports: Vec<String>,
+}
+
+fn collect_chunk_info(output: &rolldown::BundleOutput) -> Vec<ChunkInfo> {
+    let mut chunks: Vec<ChunkInfo> = output
+        .assets
+        .iter()
+        .filter_map(|asset| match asset {
+            Output::Chunk(chunk) => Some(ChunkInfo {
+                filename: chunk.filename.to_string(),
+                code: chunk.code.clone(),
+                imports: chunk.imports.iter().map(|s| s.to_string()).collect(),
+                exports: chunk.exports.iter().map(|s| s.to_string()).collect(),
+                dynamic_imports: chunk.dynamic_imports.iter().map(|s| s.to_string()).collect(),
+            }),
+            Output::Asset(_) => None,
+        })
+        .collect();
+    chunks.sort_by(|a, b| a.filename.cmp(&b.filename));
+    chunks
 }
 
 fn input_items_for_case(case: &GraphCase) -> Vec<InputItem> {
@@ -342,7 +607,7 @@ fn bundler_options_for_case(case: &GraphCase, cwd: PathBuf) -> BundlerOptions {
         input: Some(input_items_for_case(case)),
         cwd: Some(cwd),
         format: Some(OutputFormat::Esm),
-        treeshake: TreeshakeOptions::Boolean(false),
+        treeshake: TreeshakeOptions::Boolean(case.treeshake),
         preserve_entry_signatures: Some(case.preserve_entry_signatures),
         strict_execution_order: Some(case.strict_execution_order),
         ..Default::default()
@@ -643,7 +908,7 @@ fn decode_edge_list(value: &str) -> Result<Vec<(usize, usize)>, String> {
 
 fn encode_case_spec(case: &GraphCase) -> String {
     format!(
-        "n={n};e={e};c={c};s={s};d={d};r={r};p={p};o={o}",
+        "n={n};e={e};c={c};s={s};d={d};r={r};p={p};o={o};t={t}",
         n = case.node_count,
         e = encode_node_list(&case.entry_nodes),
         c = encode_node_list(&case.cjs_nodes),
@@ -652,6 +917,7 @@ fn encode_case_spec(case: &GraphCase) -> String {
         r = encode_edge_list(&case.reexport_static_edges),
         p = preserve_entry_signatures_to_index(case.preserve_entry_signatures),
         o = usize::from(case.strict_execution_order),
+        t = usize::from(case.treeshake),
     )
 }
 
@@ -664,6 +930,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
     let mut reexport_edges = None;
     let mut preserve_index = None;
     let mut strict_execution_order = None;
+    let mut treeshake = None;
 
     for part in case_spec.split(';') {
         if part.is_empty() {
@@ -711,6 +978,15 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
                     }
                 });
             }
+            "t" => {
+                treeshake = Some(match value {
+                    "1" | "true" => true,
+                    "0" | "false" => false,
+                    _ => {
+                        return Err(format!("invalid treeshake `{value}`"));
+                    }
+                });
+            }
             _ => return Err(format!("unknown case key `{key}`")),
         }
     }
@@ -748,6 +1024,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
     );
     let strict_execution_order =
         strict_execution_order.ok_or_else(|| "missing case field `o`".to_string())?;
+    let treeshake = treeshake.unwrap_or(false);
 
     Ok(GraphCase {
         seed,
@@ -759,6 +1036,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
         reexport_static_edges,
         preserve_entry_signatures,
         strict_execution_order,
+        treeshake,
     })
 }
 
