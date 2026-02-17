@@ -1,0 +1,3 @@
+[submodule "rolldown"]
+	path = rolldown
+	url = https://github.com/rolldown/rolldown.git

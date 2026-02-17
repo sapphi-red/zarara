@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["acyclic_output_fuzz"]
+exclude = ["rolldown"]
+
+[workspace.dependencies]
+rolldown = { path = "rolldown/crates/rolldown" }
+rolldown_common = { path = "rolldown/crates/rolldown_common" }
+proptest = "1.6.0"
+tokio = { version = "1.45.0", features = ["rt"] }
