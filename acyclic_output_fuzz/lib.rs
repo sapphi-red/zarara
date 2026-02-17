@@ -26,6 +26,7 @@ struct GraphCase {
     seed: u64,
     node_count: usize,
     entry_nodes: Vec<usize>,
+    cjs_nodes: Vec<usize>,
     static_edges: Vec<(usize, usize)>,
     dynamic_edges: Vec<(usize, usize)>,
     reexport_static_edges: Vec<(usize, usize)>,
@@ -89,6 +90,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                     Just(preserve_entry_signatures_index),
                     Just(strict_execution_order),
                     prop::collection::vec(any::<bool>(), node_count),
+                    prop::collection::vec(any::<bool>(), node_count),
                     prop::collection::vec(any::<bool>(), static_edge_slots),
                     prop::collection::vec(any::<bool>(), dynamic_edge_slots),
                     prop::collection::vec(any::<bool>(), static_edge_slots),
@@ -102,6 +104,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                 preserve_entry_signatures_index,
                 strict_execution_order,
                 entry_mask,
+                cjs_mask,
                 static_mask,
                 dynamic_mask,
                 reexport_mask,
@@ -112,6 +115,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                     preserve_entry_signatures_index,
                     strict_execution_order,
                     &entry_mask,
+                    &cjs_mask,
                     &static_mask,
                     &dynamic_mask,
                     &reexport_mask,
@@ -135,6 +139,7 @@ fn build_case_from_masks(
     preserve_entry_signatures_index: u8,
     strict_execution_order: bool,
     entry_mask: &[bool],
+    cjs_mask: &[bool],
     static_mask: &[bool],
     dynamic_mask: &[bool],
     reexport_mask: &[bool],
@@ -153,6 +158,11 @@ fn build_case_from_masks(
     let mut static_edges = Vec::new();
     let mut dynamic_edges = Vec::new();
     let mut reexport_static_edges = Vec::new();
+    let cjs_nodes = cjs_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(index, selected)| selected.then_some(index))
+        .collect::<Vec<_>>();
     let preserve_entry_signatures =
         preserve_entry_signatures_from_index(preserve_entry_signatures_index);
 
@@ -185,6 +195,7 @@ fn build_case_from_masks(
         seed,
         node_count,
         entry_nodes,
+        cjs_nodes,
         static_edges,
         dynamic_edges,
         reexport_static_edges,
@@ -229,6 +240,9 @@ fn case_from_seed(seed: u64) -> GraphCase {
     let entry_mask = (0..node_count)
         .map(|_| rng.next_bool(1, 2))
         .collect::<Vec<_>>();
+    let cjs_mask = (0..node_count)
+        .map(|_| rng.next_bool(1, 3))
+        .collect::<Vec<_>>();
 
     let static_edge_slots = node_count * (node_count - 1) / 2;
     let static_mask = (0..static_edge_slots)
@@ -249,6 +263,7 @@ fn case_from_seed(seed: u64) -> GraphCase {
         preserve_entry_signatures_index,
         strict_execution_order,
         &entry_mask,
+        &cjs_mask,
         &static_mask,
         &dynamic_mask,
         &reexport_mask,
@@ -317,7 +332,7 @@ fn input_items_for_case(case: &GraphCase) -> Vec<InputItem> {
         .copied()
         .map(|index| InputItem {
             name: Some(format!("entry-{index}")),
-            import: format!("./node{index}.js"),
+            import: format!("./{}", module_filename(case, index)),
         })
         .collect::<Vec<_>>()
 }
@@ -419,6 +434,18 @@ fn normalize_path(path: PathBuf) -> String {
     normalized.join("/")
 }
 
+fn is_cjs_node(case: &GraphCase, index: usize) -> bool {
+    case.cjs_nodes.binary_search(&index).is_ok()
+}
+
+fn module_filename(case: &GraphCase, index: usize) -> String {
+    if is_cjs_node(case, index) {
+        format!("node{index}.cjs")
+    } else {
+        format!("node{index}.js")
+    }
+}
+
 fn render_graph_modules(case: &GraphCase) -> Vec<(String, String)> {
     let mut static_outgoing = vec![Vec::<usize>::new(); case.node_count];
     for &(from, to) in &case.static_edges {
@@ -436,18 +463,29 @@ fn render_graph_modules(case: &GraphCase) -> Vec<(String, String)> {
 
     let mut modules = Vec::new();
     for (from, destinations) in static_outgoing.iter().enumerate() {
+        let current_file_is_cjs = is_cjs_node(case, from);
         let mut source = String::new();
         source.push_str(&format!(
             "globalThis.__acyclic_output_fuzz_{from} = {from};\n"
         ));
         for destination in destinations {
-            if reexport_static_edges.contains(&(from, *destination)) {
+            let destination_path = module_filename(case, *destination);
+            if current_file_is_cjs {
                 source.push_str(&format!(
-                    "export {{ node_{destination} as reexport_{from}_{destination} }} from \"./node{destination}.js\";\n"
+                    "const imported_{from}_{destination} = require(\"./{destination_path}\");\n"
+                ));
+                source.push_str(&format!(
+                    "exports.use_{from}_{destination} = imported_{from}_{destination};\n"
+                ));
+            } else if reexport_static_edges.contains(&(from, *destination))
+                && !is_cjs_node(case, *destination)
+            {
+                source.push_str(&format!(
+                    "export {{ node_{destination} as reexport_{from}_{destination} }} from \"./{destination_path}\";\n"
                 ));
             } else {
                 source.push_str(&format!(
-                    "import {{ node_{destination} as imported_{from}_{destination} }} from \"./node{destination}.js\";\n"
+                    "import * as imported_{from}_{destination} from \"./{destination_path}\";\n"
                 ));
                 source.push_str(&format!(
                     "export const use_{from}_{destination} = imported_{from}_{destination};\n"
@@ -455,10 +493,19 @@ fn render_graph_modules(case: &GraphCase) -> Vec<(String, String)> {
             }
         }
         for destination in &dynamic_outgoing[from] {
-            source.push_str(&format!("void import(\"./node{destination}.js\");\n"));
+            let destination_path = module_filename(case, *destination);
+            if current_file_is_cjs {
+                source.push_str(&format!("void require(\"./{destination_path}\");\n"));
+            } else {
+                source.push_str(&format!("void import(\"./{destination_path}\");\n"));
+            }
         }
-        source.push_str(&format!("export const node_{from} = {from};\n"));
-        modules.push((format!("node{from}.js"), source));
+        if current_file_is_cjs {
+            source.push_str(&format!("exports.node_{from} = {from};\n"));
+        } else {
+            source.push_str(&format!("export const node_{from} = {from};\n"));
+        }
+        modules.push((module_filename(case, from), source));
     }
 
     modules
@@ -519,6 +566,13 @@ fn normalize_entry_nodes(mut entries: Vec<usize>, node_count: usize, seed: u64) 
         entries.pop();
     }
     entries
+}
+
+fn normalize_node_set(mut nodes: Vec<usize>, node_count: usize) -> Vec<usize> {
+    nodes.retain(|index| *index < node_count);
+    nodes.sort_unstable();
+    nodes.dedup();
+    nodes
 }
 
 fn normalize_edges(mut edges: Vec<(usize, usize)>, node_count: usize) -> Vec<(usize, usize)> {
@@ -589,9 +643,10 @@ fn decode_edge_list(value: &str) -> Result<Vec<(usize, usize)>, String> {
 
 fn encode_case_spec(case: &GraphCase) -> String {
     format!(
-        "n={n};e={e};s={s};d={d};r={r};p={p};o={o}",
+        "n={n};e={e};c={c};s={s};d={d};r={r};p={p};o={o}",
         n = case.node_count,
         e = encode_node_list(&case.entry_nodes),
+        c = encode_node_list(&case.cjs_nodes),
         s = encode_edge_list(&case.static_edges),
         d = encode_edge_list(&case.dynamic_edges),
         r = encode_edge_list(&case.reexport_static_edges),
@@ -603,6 +658,7 @@ fn encode_case_spec(case: &GraphCase) -> String {
 fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
     let mut node_count = None;
     let mut entries = None;
+    let mut cjs_nodes = None;
     let mut static_edges = None;
     let mut dynamic_edges = None;
     let mut reexport_edges = None;
@@ -626,6 +682,9 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
             }
             "e" => {
                 entries = Some(decode_node_list(value)?);
+            }
+            "c" => {
+                cjs_nodes = Some(decode_node_list(value)?);
             }
             "s" => {
                 static_edges = Some(decode_edge_list(value)?);
@@ -667,6 +726,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
         node_count,
         seed,
     );
+    let cjs_nodes = normalize_node_set(cjs_nodes.unwrap_or_default(), node_count);
     let static_edges = normalize_edges(
         static_edges.ok_or_else(|| "missing case field `s`".to_string())?,
         node_count,
@@ -693,6 +753,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
         seed,
         node_count,
         entry_nodes,
+        cjs_nodes,
         static_edges,
         dynamic_edges,
         reexport_static_edges,
@@ -794,7 +855,7 @@ fn build_repl_url(case: &GraphCase, options: &BundlerOptions) -> String {
     let entry_files = case
         .entry_nodes
         .iter()
-        .map(|index| format!("node{index}.js"))
+        .map(|index| module_filename(case, *index))
         .collect::<HashSet<_>>();
 
     let mut files = serde_json::Map::new();
@@ -944,6 +1005,7 @@ fn format_failure_message(
             "## Structure\n",
             "- Nodes: `{node_count}`\n",
             "- Entry nodes: `{entry_nodes:?}`\n",
+            "- CJS nodes: `{cjs_nodes:?}`\n",
             "- Preserve entry signatures: `{preserve_entry_signatures:?}`\n",
             "- Strict execution order: `{strict_execution_order:?}`\n\n",
             "### Input Static Edges\n",
@@ -970,6 +1032,7 @@ fn format_failure_message(
         seed = case.seed,
         node_count = case.node_count,
         entry_nodes = case.entry_nodes,
+        cjs_nodes = case.cjs_nodes,
         preserve_entry_signatures = options.preserve_entry_signatures,
         strict_execution_order = options.strict_execution_order,
         input_static_edges = input_static_edges,
