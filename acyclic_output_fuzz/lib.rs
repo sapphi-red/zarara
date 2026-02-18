@@ -36,6 +36,7 @@ struct GraphCase {
     preserve_entry_signatures: PreserveEntrySignatures,
     strict_execution_order: bool,
     treeshake: bool,
+    minify_internal_exports: bool,
 }
 
 impl std::fmt::Debug for GraphCase {
@@ -115,9 +116,10 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
         0u8..4u8,
         any::<bool>(),
         any::<bool>(),
+        any::<bool>(),
     )
         .prop_flat_map(
-            |(seed, node_count, preserve_entry_signatures_index, strict_execution_order, treeshake)| {
+            |(seed, node_count, preserve_entry_signatures_index, strict_execution_order, treeshake, minify_internal_exports)| {
                 let static_edge_slots = node_count * (node_count - 1) / 2;
                 let dynamic_edge_slots = node_count * (node_count - 1);
                 (
@@ -126,6 +128,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                     Just(preserve_entry_signatures_index),
                     Just(strict_execution_order),
                     Just(treeshake),
+                    Just(minify_internal_exports),
                     prop::collection::vec(any::<bool>(), node_count),
                     prop::collection::vec(any::<bool>(), node_count),
                     prop::collection::vec(any::<bool>(), static_edge_slots),
@@ -141,6 +144,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                 preserve_entry_signatures_index,
                 strict_execution_order,
                 treeshake,
+                minify_internal_exports,
                 entry_mask,
                 cjs_mask,
                 static_mask,
@@ -153,6 +157,7 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                     preserve_entry_signatures_index,
                     strict_execution_order,
                     treeshake,
+                    minify_internal_exports,
                     &entry_mask,
                     &cjs_mask,
                     &static_mask,
@@ -178,6 +183,7 @@ fn build_case_from_masks(
     preserve_entry_signatures_index: u8,
     strict_execution_order: bool,
     treeshake: bool,
+    minify_internal_exports: bool,
     entry_mask: &[bool],
     cjs_mask: &[bool],
     static_mask: &[bool],
@@ -242,6 +248,7 @@ fn build_case_from_masks(
         preserve_entry_signatures,
         strict_execution_order,
         treeshake,
+        minify_internal_exports,
     }
 }
 
@@ -278,6 +285,7 @@ fn case_from_seed(seed: u64) -> GraphCase {
     let preserve_entry_signatures_index = (rng.next_u64() % 4) as u8;
     let strict_execution_order = rng.next_bool(1, 2);
     let treeshake = rng.next_bool(1, 2);
+    let minify_internal_exports = rng.next_bool(1, 2);
 
     let entry_mask = (0..node_count)
         .map(|_| rng.next_bool(1, 2))
@@ -305,6 +313,7 @@ fn case_from_seed(seed: u64) -> GraphCase {
         preserve_entry_signatures_index,
         strict_execution_order,
         treeshake,
+        minify_internal_exports,
         &entry_mask,
         &cjs_mask,
         &static_mask,
@@ -610,6 +619,7 @@ fn bundler_options_for_case(case: &GraphCase, cwd: PathBuf) -> BundlerOptions {
         treeshake: TreeshakeOptions::Boolean(case.treeshake),
         preserve_entry_signatures: Some(case.preserve_entry_signatures),
         strict_execution_order: Some(case.strict_execution_order),
+        minify_internal_exports: Some(case.minify_internal_exports),
         ..Default::default()
     }
 }
@@ -908,7 +918,7 @@ fn decode_edge_list(value: &str) -> Result<Vec<(usize, usize)>, String> {
 
 fn encode_case_spec(case: &GraphCase) -> String {
     format!(
-        "n={n};e={e};c={c};s={s};d={d};r={r};p={p};o={o};t={t}",
+        "n={n};e={e};c={c};s={s};d={d};r={r};p={p};o={o};t={t};m={m}",
         n = case.node_count,
         e = encode_node_list(&case.entry_nodes),
         c = encode_node_list(&case.cjs_nodes),
@@ -918,6 +928,7 @@ fn encode_case_spec(case: &GraphCase) -> String {
         p = preserve_entry_signatures_to_index(case.preserve_entry_signatures),
         o = usize::from(case.strict_execution_order),
         t = usize::from(case.treeshake),
+        m = usize::from(case.minify_internal_exports),
     )
 }
 
@@ -931,6 +942,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
     let mut preserve_index = None;
     let mut strict_execution_order = None;
     let mut treeshake = None;
+    let mut minify_internal_exports = None;
 
     for part in case_spec.split(';') {
         if part.is_empty() {
@@ -987,6 +999,15 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
                     }
                 });
             }
+            "m" => {
+                minify_internal_exports = Some(match value {
+                    "1" | "true" => true,
+                    "0" | "false" => false,
+                    _ => {
+                        return Err(format!("invalid minifyInternalExports `{value}`"));
+                    }
+                });
+            }
             _ => return Err(format!("unknown case key `{key}`")),
         }
     }
@@ -1025,6 +1046,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
     let strict_execution_order =
         strict_execution_order.ok_or_else(|| "missing case field `o`".to_string())?;
     let treeshake = treeshake.unwrap_or(false);
+    let minify_internal_exports = minify_internal_exports.unwrap_or(true);
 
     Ok(GraphCase {
         seed,
@@ -1037,6 +1059,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
         preserve_entry_signatures,
         strict_execution_order,
         treeshake,
+        minify_internal_exports,
     })
 }
 
@@ -1066,6 +1089,7 @@ fn render_rolldown_config_js(case: &GraphCase, options: &BundlerOptions) -> Stri
     );
     let treeshake = treeshake_to_config_value(&options.treeshake);
     let strict_execution_order = options.strict_execution_order.unwrap_or(false);
+    let minify_internal_exports = options.minify_internal_exports.unwrap_or(true);
 
     let config = format!(
         concat!(
@@ -1078,6 +1102,7 @@ fn render_rolldown_config_js(case: &GraphCase, options: &BundlerOptions) -> Stri
             "  preserveEntrySignatures: {preserve_entry_signatures},\n",
             "  output: {{\n",
             "    strictExecutionOrder: {strict_execution_order},\n",
+            "    minifyInternalExports: {minify_internal_exports},\n",
             "  }},\n",
             "}};\n"
         ),
@@ -1086,6 +1111,7 @@ fn render_rolldown_config_js(case: &GraphCase, options: &BundlerOptions) -> Stri
         treeshake = treeshake,
         preserve_entry_signatures = preserve_entry_signatures,
         strict_execution_order = strict_execution_order,
+        minify_internal_exports = minify_internal_exports,
     );
     config
 }
@@ -1285,7 +1311,8 @@ fn format_failure_message(
             "- Entry nodes: `{entry_nodes:?}`\n",
             "- CJS nodes: `{cjs_nodes:?}`\n",
             "- Preserve entry signatures: `{preserve_entry_signatures:?}`\n",
-            "- Strict execution order: `{strict_execution_order:?}`\n\n",
+            "- Strict execution order: `{strict_execution_order:?}`\n",
+            "- Minify internal exports: `{minify_internal_exports:?}`\n\n",
             "### Input Static Edges\n",
             "{input_static_edges}\n\n",
             "### Input Static Reexport Edges\n",
@@ -1313,6 +1340,7 @@ fn format_failure_message(
         cjs_nodes = case.cjs_nodes,
         preserve_entry_signatures = options.preserve_entry_signatures,
         strict_execution_order = options.strict_execution_order,
+        minify_internal_exports = options.minify_internal_exports,
         input_static_edges = input_static_edges,
         input_reexport_edges = input_reexport_edges,
         input_dynamic_edges = input_dynamic_edges,
