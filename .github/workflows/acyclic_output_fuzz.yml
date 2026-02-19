@@ -32,7 +32,7 @@ jobs:
         id: fuzz
         continue-on-error: true
         env:
-          PROPTEST_CASES: 500
+          PROPTEST_CASES: 5000
         run: |
           set -o pipefail
           timeout 900 cargo test --manifest-path acyclic_output_fuzz/Cargo.toml -- --nocapture 2>&1 | tee acyclic_output_fuzz.log
