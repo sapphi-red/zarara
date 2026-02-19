@@ -39,29 +39,36 @@ jobs:
 
       - name: Check if update is needed
         id: check
+        env:
+          CURRENT_TAG: ${{ steps.current.outputs.tag }}
+          LATEST_TAG: ${{ steps.latest.outputs.tag }}
         run: |
-          if [ "${{ steps.current.outputs.tag }}" = "${{ steps.latest.outputs.tag }}" ]; then
-            echo "Already up to date (${{ steps.current.outputs.tag }})"
+          if [ "$CURRENT_TAG" = "$LATEST_TAG" ]; then
+            echo "Already up to date ($CURRENT_TAG)"
             echo "needed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Update available: ${{ steps.current.outputs.tag }} -> ${{ steps.latest.outputs.tag }}"
+            echo "Update available: $CURRENT_TAG -> $LATEST_TAG"
             echo "needed=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Update submodule to latest tag
         if: steps.check.outputs.needed == 'true'
         working-directory: rolldown
+        env:
+          LATEST_TAG: ${{ steps.latest.outputs.tag }}
         run: |
           git fetch --tags
-          git checkout "${{ steps.latest.outputs.tag }}"
+          git checkout "$LATEST_TAG"
 
       - name: Create pull request
         if: steps.check.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_TAG: ${{ steps.current.outputs.tag }}
+          LATEST_TAG: ${{ steps.latest.outputs.tag }}
         run: |
-          branch="rolldown-update/${{ steps.latest.outputs.tag }}"
-          title="chore: update rolldown to ${{ steps.latest.outputs.tag }}"
+          branch="rolldown-update/$LATEST_TAG"
+          title="chore: update rolldown to $LATEST_TAG"
 
           # Check if a PR already exists for this branch
           existing=$(gh pr list --head "$branch" --json number --jq 'length')
@@ -79,5 +86,5 @@ jobs:
 
           gh pr create \
             --title "$title" \
-            --body "Automated update of the rolldown submodule from \`${{ steps.current.outputs.tag }}\` to \`${{ steps.latest.outputs.tag }}\`." \
+            --body "Automated update of the rolldown submodule from \`$CURRENT_TAG\` to \`$LATEST_TAG\`." \
             --head "$branch"
