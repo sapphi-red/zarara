@@ -60,6 +60,22 @@ jobs:
           git fetch --tags --recurse-submodules=no
           git checkout "$LATEST_TAG"
 
+      - name: Setup Rust
+        if: steps.check.outputs.needed == 'true'
+        uses: oxc-project/setup-rust@c8224157c0bf235aabc633e8cd50d344f087a7de # v1.0.12
+        with:
+          cache-key: debug-build
+
+      - name: Sync oxc version with rolldown
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          # Extract oxc version from rolldown's resolved dependencies
+          oxc_version=$(cargo metadata --format-version 1 --manifest-path rolldown/Cargo.toml | jq -r '.packages[] | select(.name == "oxc") | .version')
+          echo "Rolldown uses oxc $oxc_version"
+          # Update oxc version in zarara's workspace Cargo.toml
+          sed -i "s/^oxc = \".*\"/oxc = \"$oxc_version\"/" Cargo.toml
+          cargo update -p oxc
+
       - name: Create pull request
         if: steps.check.outputs.needed == 'true'
         env:
@@ -80,7 +96,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add rolldown
+          git add rolldown Cargo.toml Cargo.lock
           git commit -m "$title"
           git push origin "$branch"
 
