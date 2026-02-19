@@ -57,7 +57,7 @@ jobs:
         env:
           LATEST_TAG: ${{ steps.latest.outputs.tag }}
         run: |
-          git fetch --tags
+          git fetch --tags --recurse-submodules=no
           git checkout "$LATEST_TAG"
 
       - name: Create pull request
