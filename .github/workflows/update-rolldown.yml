@@ -23,7 +23,7 @@ jobs:
         id: current
         working-directory: rolldown
         run: |
-          git fetch --tags
+          git fetch --tags --recurse-submodules=no
           tag=$(git describe --tags --exact-match)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Current rolldown tag: $tag"
