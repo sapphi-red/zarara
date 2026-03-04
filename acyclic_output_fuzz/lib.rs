@@ -14,7 +14,8 @@ use proptest::test_runner::{
     Config as ProptestConfig, RngSeed, TestCaseError, TestError, TestRunner,
 };
 use rolldown::{
-    Bundler, BundlerOptions, InputItem, OutputFormat, PreserveEntrySignatures, TreeshakeOptions,
+    Bundler, BundlerOptions, InputItem, IsExternal, OutputFormat, PreserveEntrySignatures,
+    TreeshakeOptions,
 };
 use rolldown_common::Output;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +24,11 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_NODES: usize = 12;
+const MAX_EXTERNAL_MODULES: usize = 4;
+
+fn external_module_name(index: usize) -> String {
+    format!("external-{index}")
+}
 
 #[derive(Clone)]
 struct GraphCase {
@@ -33,6 +39,8 @@ struct GraphCase {
     static_edges: Vec<(usize, usize)>,
     dynamic_edges: Vec<(usize, usize)>,
     reexport_static_edges: Vec<(usize, usize)>,
+    external_module_count: usize,
+    external_dynamic_edges: Vec<(usize, usize)>,
     preserve_entry_signatures: PreserveEntrySignatures,
     strict_execution_order: bool,
     treeshake: bool,
@@ -109,19 +117,24 @@ fn deterministic_output() {
     }
 }
 
-fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
+/// Strategy that generates the topology known to trigger output cycles:
+/// entries dynamically import a hub, the hub statically+dynamically imports children,
+/// and the hub has external dynamic imports.
+fn dynamic_hub_case_strategy() -> impl Strategy<Value = GraphCase> {
     (
         any::<u64>().no_shrink(),
-        3usize..=MAX_NODES,
+        5usize..=MAX_NODES,
         0u8..4u8,
         any::<bool>(),
         any::<bool>(),
         any::<bool>(),
+        1usize..=MAX_EXTERNAL_MODULES,
     )
         .prop_flat_map(
-            |(seed, node_count, preserve_entry_signatures_index, strict_execution_order, treeshake, minify_internal_exports)| {
-                let static_edge_slots = node_count * (node_count - 1) / 2;
-                let dynamic_edge_slots = node_count * (node_count - 1);
+            move |(seed, node_count, preserve_entry_signatures_index, strict_execution_order, treeshake, minify_internal_exports, external_module_count)| {
+                // Pick how many entries (1..3) and how many children (2..min(4, remaining))
+                let max_entries = (node_count - 2).min(3);
+                let max_children = (node_count - 2).min(4);
                 (
                     Just(seed),
                     Just(node_count),
@@ -129,11 +142,10 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                     Just(strict_execution_order),
                     Just(treeshake),
                     Just(minify_internal_exports),
-                    prop::collection::vec(any::<bool>(), node_count),
-                    prop::collection::vec(any::<bool>(), node_count),
-                    prop::collection::vec(any::<bool>(), static_edge_slots),
-                    prop::collection::vec(any::<bool>(), dynamic_edge_slots),
-                    prop::collection::vec(any::<bool>(), static_edge_slots),
+                    Just(external_module_count),
+                    1usize..=max_entries,
+                    2usize..=max_children,
+                    prop::collection::vec(any::<bool>(), external_module_count),
                 )
             },
         )
@@ -145,11 +157,145 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                 strict_execution_order,
                 treeshake,
                 minify_internal_exports,
+                external_module_count,
+                num_entries,
+                num_children,
+                ext_mask,
+            )| {
+                // Layout: entries are 0..num_entries, hub is num_entries, children are (num_entries+1)..
+                let hub = num_entries;
+                let children_start = hub + 1;
+                let children_end = (children_start + num_children).min(node_count);
+
+                let entry_nodes = (0..num_entries).collect::<Vec<_>>();
+
+                let mut static_edges = Vec::new();
+                let mut dynamic_edges = Vec::new();
+
+                // Entries only dynamically import the hub (no static path to hub/children)
+                for &e in &entry_nodes {
+                    dynamic_edges.push((e, hub));
+                }
+
+                // Hub statically imports all children
+                for c in children_start..children_end {
+                    static_edges.push((hub, c));
+                    // Hub also dynamically imports children (dual import)
+                    dynamic_edges.push((hub, c));
+                }
+
+                // Hub has external dynamic imports
+                let mut external_dynamic_edges = Vec::new();
+                for (ext, &has_edge) in ext_mask.iter().enumerate() {
+                    if has_edge {
+                        external_dynamic_edges.push((hub, ext));
+                    }
+                }
+                // Ensure at least one external dynamic import from hub
+                if external_dynamic_edges.is_empty() {
+                    external_dynamic_edges.push((hub, 0));
+                }
+
+                let preserve_entry_signatures =
+                    preserve_entry_signatures_from_index(preserve_entry_signatures_index);
+
+                GraphCase {
+                    seed,
+                    node_count,
+                    entry_nodes,
+                    cjs_nodes: Vec::new(), // all ESM
+                    static_edges,
+                    dynamic_edges,
+                    reexport_static_edges: Vec::new(),
+                    external_module_count,
+                    external_dynamic_edges,
+                    preserve_entry_signatures,
+                    strict_execution_order,
+                    treeshake,
+                    minify_internal_exports,
+                }
+            },
+        )
+}
+
+#[test]
+fn dynamic_hub_produces_acyclic_output() {
+    let mut config = ProptestConfig {
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    };
+    if let Ok(seed_text) = std::env::var("PROPTEST_RNG_SEED") {
+        let seed = seed_text
+            .parse::<u64>()
+            .expect("PROPTEST_RNG_SEED must be a u64");
+        config.rng_seed = RngSeed::Fixed(seed);
+    }
+
+    let mut runner = TestRunner::new(config);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    match runner.run(&dynamic_hub_case_strategy(), |case| {
+        runtime
+            .block_on(run_case(case))
+            .map_err(TestCaseError::fail)?;
+        Ok(())
+    }) {
+        Ok(()) => {}
+        Err(TestError::Fail(why, _)) => panic!("{why}"),
+        Err(TestError::Abort(why)) => panic!("Proptest aborted: {why}"),
+    }
+}
+
+fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
+    (
+        any::<u64>().no_shrink(),
+        3usize..=MAX_NODES,
+        0u8..4u8,
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+        1usize..=MAX_EXTERNAL_MODULES,
+    )
+        .prop_flat_map(
+            |(seed, node_count, preserve_entry_signatures_index, strict_execution_order, treeshake, minify_internal_exports, external_module_count)| {
+                let static_edge_slots = node_count * (node_count - 1) / 2;
+                let dynamic_edge_slots = node_count * (node_count - 1);
+                let external_dynamic_slots = node_count * external_module_count;
+                (
+                    Just(seed),
+                    Just(node_count),
+                    Just(preserve_entry_signatures_index),
+                    Just(strict_execution_order),
+                    Just(treeshake),
+                    Just(minify_internal_exports),
+                    Just(external_module_count),
+                    prop::collection::vec(any::<bool>(), node_count),
+                    prop::collection::vec(any::<u8>().prop_map(|x| x % 5 == 0), node_count),
+                    prop::collection::vec(any::<bool>(), static_edge_slots),
+                    (
+                        prop::collection::vec(0u8..=2u8, dynamic_edge_slots),
+                        prop::collection::vec(any::<bool>(), static_edge_slots),
+                        prop::collection::vec(any::<bool>(), external_dynamic_slots),
+                    ),
+                )
+            },
+        )
+        .prop_map(
+            |(
+                seed,
+                node_count,
+                preserve_entry_signatures_index,
+                strict_execution_order,
+                treeshake,
+                minify_internal_exports,
+                external_module_count,
                 entry_mask,
                 cjs_mask,
                 static_mask,
-                dynamic_mask,
-                reexport_mask,
+                (dynamic_mask, reexport_mask, external_dynamic_mask),
             )| {
                 build_case_from_masks(
                     seed,
@@ -163,6 +309,8 @@ fn acyclic_graph_case_strategy() -> impl Strategy<Value = GraphCase> {
                     &static_mask,
                     &dynamic_mask,
                     &reexport_mask,
+                    external_module_count,
+                    &external_dynamic_mask,
                 )
             },
         )
@@ -187,8 +335,10 @@ fn build_case_from_masks(
     entry_mask: &[bool],
     cjs_mask: &[bool],
     static_mask: &[bool],
-    dynamic_mask: &[bool],
+    dynamic_mask: &[u8],
     reexport_mask: &[bool],
+    external_module_count: usize,
+    external_dynamic_mask: &[bool],
 ) -> GraphCase {
     let mut entry_nodes = entry_mask
         .iter()
@@ -230,10 +380,21 @@ fn build_case_from_masks(
             if from == to {
                 continue;
             }
-            if dynamic_mask[dynamic_idx] {
+            for _ in 0..dynamic_mask[dynamic_idx] {
                 dynamic_edges.push((from, to));
             }
             dynamic_idx += 1;
+        }
+    }
+
+    let mut external_dynamic_edges = Vec::new();
+    let mut ext_idx = 0;
+    for from in 0..node_count {
+        for ext in 0..external_module_count {
+            if external_dynamic_mask[ext_idx] {
+                external_dynamic_edges.push((from, ext));
+            }
+            ext_idx += 1;
         }
     }
 
@@ -245,6 +406,8 @@ fn build_case_from_masks(
         static_edges,
         dynamic_edges,
         reexport_static_edges,
+        external_module_count,
+        external_dynamic_edges,
         preserve_entry_signatures,
         strict_execution_order,
         treeshake,
@@ -286,6 +449,7 @@ fn case_from_seed(seed: u64) -> GraphCase {
     let strict_execution_order = rng.next_bool(1, 2);
     let treeshake = rng.next_bool(1, 2);
     let minify_internal_exports = rng.next_bool(1, 2);
+    let external_module_count = 1 + rng.next_u64() as usize % MAX_EXTERNAL_MODULES;
 
     let entry_mask = (0..node_count)
         .map(|_| rng.next_bool(1, 2))
@@ -304,7 +468,12 @@ fn case_from_seed(seed: u64) -> GraphCase {
 
     let dynamic_edge_slots = node_count * (node_count - 1);
     let dynamic_mask = (0..dynamic_edge_slots)
-        .map(|_| rng.next_bool(1, 2))
+        .map(|_| (rng.next_u64() % 3) as u8)
+        .collect::<Vec<_>>();
+
+    let external_dynamic_slots = node_count * external_module_count;
+    let external_dynamic_mask = (0..external_dynamic_slots)
+        .map(|_| rng.next_bool(1, 3))
         .collect::<Vec<_>>();
 
     build_case_from_masks(
@@ -319,6 +488,8 @@ fn case_from_seed(seed: u64) -> GraphCase {
         &static_mask,
         &dynamic_mask,
         &reexport_mask,
+        external_module_count,
+        &external_dynamic_mask,
     )
 }
 
@@ -612,6 +783,15 @@ fn input_items_for_case(case: &GraphCase) -> Vec<InputItem> {
 }
 
 fn bundler_options_for_case(case: &GraphCase, cwd: PathBuf) -> BundlerOptions {
+    let external = if case.external_module_count > 0 {
+        Some(IsExternal::from(
+            (0..case.external_module_count)
+                .map(external_module_name)
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        None
+    };
     BundlerOptions {
         input: Some(input_items_for_case(case)),
         cwd: Some(cwd),
@@ -620,6 +800,7 @@ fn bundler_options_for_case(case: &GraphCase, cwd: PathBuf) -> BundlerOptions {
         preserve_entry_signatures: Some(case.preserve_entry_signatures),
         strict_execution_order: Some(case.strict_execution_order),
         minify_internal_exports: Some(case.minify_internal_exports),
+        external,
         ..Default::default()
     }
 }
@@ -730,6 +911,10 @@ fn render_graph_modules(case: &GraphCase) -> Vec<(String, String)> {
     for &(from, to) in &case.dynamic_edges {
         dynamic_outgoing[from].push(to);
     }
+    let mut external_dynamic_outgoing = vec![Vec::<usize>::new(); case.node_count];
+    for &(from, ext_index) in &case.external_dynamic_edges {
+        external_dynamic_outgoing[from].push(ext_index);
+    }
     let reexport_static_edges = case
         .reexport_static_edges
         .iter()
@@ -763,7 +948,13 @@ fn render_graph_modules(case: &GraphCase) -> Vec<(String, String)> {
                     "import * as imported_{from}_{destination} from \"./{destination_path}\";\n"
                 ));
                 source.push_str(&format!(
-                    "export const use_{from}_{destination} = imported_{from}_{destination};\n"
+                    "var use_{from}_{destination} = imported_{from}_{destination};\n"
+                ));
+                source.push_str(&format!(
+                    "use_{from}_{destination}.ref = {from};\n"
+                ));
+                source.push_str(&format!(
+                    "export {{ use_{from}_{destination} }};\n"
                 ));
             }
         }
@@ -775,10 +966,20 @@ fn render_graph_modules(case: &GraphCase) -> Vec<(String, String)> {
                 source.push_str(&format!("void import(\"./{destination_path}\");\n"));
             }
         }
+        for ext_index in &external_dynamic_outgoing[from] {
+            let ext_name = external_module_name(*ext_index);
+            if current_file_is_cjs {
+                source.push_str(&format!("void require(\"{ext_name}\");\n"));
+            } else {
+                source.push_str(&format!("void import(\"{ext_name}\");\n"));
+            }
+        }
         if current_file_is_cjs {
             source.push_str(&format!("exports.node_{from} = {from};\n"));
         } else {
-            source.push_str(&format!("export const node_{from} = {from};\n"));
+            source.push_str(&format!("var node_{from} = {{}};\n"));
+            source.push_str(&format!("node_{from}.value = {from};\n"));
+            source.push_str(&format!("export {{ node_{from} }};\n"));
         }
         modules.push((module_filename(case, from), source));
     }
@@ -857,6 +1058,15 @@ fn normalize_edges(mut edges: Vec<(usize, usize)>, node_count: usize) -> Vec<(us
     edges
 }
 
+fn normalize_edges_allow_dupes(
+    mut edges: Vec<(usize, usize)>,
+    node_count: usize,
+) -> Vec<(usize, usize)> {
+    edges.retain(|(from, to)| *from < node_count && *to < node_count && from != to);
+    edges.sort_unstable();
+    edges
+}
+
 fn encode_node_list(nodes: &[usize]) -> String {
     if nodes.is_empty() {
         "none".to_string()
@@ -916,15 +1126,38 @@ fn decode_edge_list(value: &str) -> Result<Vec<(usize, usize)>, String> {
         .collect::<Result<Vec<_>, _>>()
 }
 
+fn encode_external_spec(count: usize, edges: &[(usize, usize)]) -> String {
+    if count == 0 {
+        "none".to_string()
+    } else {
+        format!("{count}:{}", encode_edge_list(edges))
+    }
+}
+
+fn decode_external_spec(value: &str) -> Result<(usize, Vec<(usize, usize)>), String> {
+    if value.is_empty() || value == "none" {
+        return Ok((0, Vec::new()));
+    }
+    let (count_str, edges_str) = value
+        .split_once(':')
+        .ok_or_else(|| format!("invalid external spec `{value}`"))?;
+    let count = count_str
+        .parse::<usize>()
+        .map_err(|_| format!("invalid external module count `{count_str}`"))?;
+    let edges = decode_edge_list(edges_str)?;
+    Ok((count, edges))
+}
+
 fn encode_case_spec(case: &GraphCase) -> String {
     format!(
-        "n={n};e={e};c={c};s={s};d={d};r={r};p={p};o={o};t={t};m={m}",
+        "n={n};e={e};c={c};s={s};d={d};r={r};x={x};p={p};o={o};t={t};m={m}",
         n = case.node_count,
         e = encode_node_list(&case.entry_nodes),
         c = encode_node_list(&case.cjs_nodes),
         s = encode_edge_list(&case.static_edges),
         d = encode_edge_list(&case.dynamic_edges),
         r = encode_edge_list(&case.reexport_static_edges),
+        x = encode_external_spec(case.external_module_count, &case.external_dynamic_edges),
         p = preserve_entry_signatures_to_index(case.preserve_entry_signatures),
         o = usize::from(case.strict_execution_order),
         t = usize::from(case.treeshake),
@@ -939,6 +1172,7 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
     let mut static_edges = None;
     let mut dynamic_edges = None;
     let mut reexport_edges = None;
+    let mut external_spec = None;
     let mut preserve_index = None;
     let mut strict_execution_order = None;
     let mut treeshake = None;
@@ -973,6 +1207,9 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
             }
             "r" => {
                 reexport_edges = Some(decode_edge_list(value)?);
+            }
+            "x" => {
+                external_spec = Some(decode_external_spec(value)?);
             }
             "p" => {
                 preserve_index = Some(
@@ -1028,10 +1265,18 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
         static_edges.ok_or_else(|| "missing case field `s`".to_string())?,
         node_count,
     );
-    let dynamic_edges = normalize_edges(
+    let dynamic_edges = normalize_edges_allow_dupes(
         dynamic_edges.ok_or_else(|| "missing case field `d`".to_string())?,
         node_count,
     );
+    let (external_module_count, external_dynamic_edges) =
+        external_spec.unwrap_or((0, Vec::new()));
+    let external_dynamic_edges = {
+        let mut edges = external_dynamic_edges;
+        edges.retain(|(from, ext)| *from < node_count && *ext < external_module_count);
+        edges.sort_unstable();
+        edges
+    };
     let static_edge_set = static_edges.iter().copied().collect::<HashSet<_>>();
     let reexport_static_edges = normalize_edges(
         reexport_edges.ok_or_else(|| "missing case field `r`".to_string())?,
@@ -1056,6 +1301,8 @@ fn parse_case_spec(seed: u64, case_spec: &str) -> Result<GraphCase, String> {
         static_edges,
         dynamic_edges,
         reexport_static_edges,
+        external_module_count,
+        external_dynamic_edges,
         preserve_entry_signatures,
         strict_execution_order,
         treeshake,
@@ -1091,6 +1338,16 @@ fn render_rolldown_config_js(case: &GraphCase, options: &BundlerOptions) -> Stri
     let strict_execution_order = options.strict_execution_order.unwrap_or(false);
     let minify_internal_exports = options.minify_internal_exports.unwrap_or(true);
 
+    let external_line = if case.external_module_count > 0 {
+        let names = (0..case.external_module_count)
+            .map(|i| format!("\"{}\"", external_module_name(i)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("  external: [{names}],\n")
+    } else {
+        String::new()
+    };
+
     let config = format!(
         concat!(
             "// Generated by `cargo run -p acyclic_output_fuzz --bin generate_fixture -- --seed {seed}`\n",
@@ -1098,6 +1355,7 @@ fn render_rolldown_config_js(case: &GraphCase, options: &BundlerOptions) -> Stri
             "  input: {{\n",
             "{inputs}\n",
             "  }},\n",
+            "{external}",
             "  treeshake: {treeshake},\n",
             "  preserveEntrySignatures: {preserve_entry_signatures},\n",
             "  output: {{\n",
@@ -1108,6 +1366,7 @@ fn render_rolldown_config_js(case: &GraphCase, options: &BundlerOptions) -> Stri
         ),
         seed = case.seed,
         inputs = input_entries,
+        external = external_line,
         treeshake = treeshake,
         preserve_entry_signatures = preserve_entry_signatures,
         strict_execution_order = strict_execution_order,
@@ -1257,6 +1516,11 @@ fn format_failure_message(
         .iter()
         .map(|(from, to)| format!("- `node{from}` -> `node{to}`"))
         .collect::<Vec<_>>();
+    let input_external_dynamic_edge_lines = case
+        .external_dynamic_edges
+        .iter()
+        .map(|(from, ext)| format!("- `node{from}` -> `{}`", external_module_name(*ext)))
+        .collect::<Vec<_>>();
     let output_file_lines = output_files
         .iter()
         .map(|file| format!("- `{file}`"))
@@ -1282,6 +1546,11 @@ fn format_failure_message(
         "- (none)".to_string()
     } else {
         input_dynamic_edge_lines.join("\n")
+    };
+    let input_external_dynamic_edges = if input_external_dynamic_edge_lines.is_empty() {
+        "- (none)".to_string()
+    } else {
+        input_external_dynamic_edge_lines.join("\n")
     };
     let output_files_markdown = if output_file_lines.is_empty() {
         "- (none)".to_string()
@@ -1312,13 +1581,16 @@ fn format_failure_message(
             "- CJS nodes: `{cjs_nodes:?}`\n",
             "- Preserve entry signatures: `{preserve_entry_signatures:?}`\n",
             "- Strict execution order: `{strict_execution_order:?}`\n",
-            "- Minify internal exports: `{minify_internal_exports:?}`\n\n",
+            "- Minify internal exports: `{minify_internal_exports:?}`\n",
+            "- External modules: `{external_module_count}`\n\n",
             "### Input Static Edges\n",
             "{input_static_edges}\n\n",
             "### Input Static Reexport Edges\n",
             "{input_reexport_edges}\n\n",
             "### Input Dynamic Edges\n",
             "{input_dynamic_edges}\n\n",
+            "### Input External Dynamic Edges\n",
+            "{input_external_dynamic_edges}\n\n",
             "### Output Files\n",
             "{output_files}\n\n",
             "### Output Static Edges\n",
@@ -1341,9 +1613,11 @@ fn format_failure_message(
         preserve_entry_signatures = options.preserve_entry_signatures,
         strict_execution_order = options.strict_execution_order,
         minify_internal_exports = options.minify_internal_exports,
+        external_module_count = case.external_module_count,
         input_static_edges = input_static_edges,
         input_reexport_edges = input_reexport_edges,
         input_dynamic_edges = input_dynamic_edges,
+        input_external_dynamic_edges = input_external_dynamic_edges,
         output_files = output_files_markdown,
         output_static_edges = output_static_edges,
         output_static_cycle = output_static_cycle,
