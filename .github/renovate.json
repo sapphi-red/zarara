@@ -9,6 +9,7 @@
   "labels": ["dependencies"],
   "ignorePaths": ["**/node_modules/**"],
   "rangeStrategy": "bump",
+  "cloneSubmodules": true,
   "packageRules": [
     {
       "matchDepTypes": ["action"],
