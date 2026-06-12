@@ -642,22 +642,32 @@ async fn run_case(case: GraphCase) -> Result<(), String> {
         }
     };
 
-    let (output_files, output_static_edges, output_dynamic_edges) =
+    let (output_files, output_static_edges, output_dynamic_edges, chunk_has_cjs) =
         build_output_dependency_graph(&output);
     let output_static_cycle =
         graph_cycle_checker::find_cycle(output_files.len(), &output_static_edges);
 
     if let Some(cycle) = output_static_cycle.as_ref() {
-        return Err(format_failure_message(
-            &case,
-            &fixture_dir,
-            &options,
-            &output_files,
-            &output_static_edges,
-            &output_dynamic_edges,
-            Some(cycle),
-            None,
-        ));
+        // An *immediate* (two-chunk) cycle that involves a CommonJS module is an
+        // inherent CJS/ESM interop limitation rather than a Rolldown defect: a CJS
+        // and an ESM chunk that import each other directly form the immediate cycle
+        // that Node.js rejects at runtime with `ERR_REQUIRE_CYCLE_MODULE`. Larger
+        // cycles, and cycles between pure-ESM chunks, are still genuine Rolldown
+        // output-graph defects and must be reported.
+        let is_cjs_immediate_cycle =
+            is_immediate_cycle(cycle) && cycle_involves_cjs(cycle, &chunk_has_cjs);
+        if !is_cjs_immediate_cycle {
+            return Err(format_failure_message(
+                &case,
+                &fixture_dir,
+                &options,
+                &output_files,
+                &output_static_edges,
+                &output_dynamic_edges,
+                Some(cycle),
+                None,
+            ));
+        }
     }
 
     validate_output_js_syntax(&output)?;
@@ -807,7 +817,12 @@ fn bundler_options_for_case(case: &GraphCase, cwd: PathBuf) -> BundlerOptions {
 
 fn build_output_dependency_graph(
     output: &rolldown::BundleOutput,
-) -> (Vec<String>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
+) -> (
+    Vec<String>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize)>,
+    Vec<bool>,
+) {
     let chunks = output
         .assets
         .iter()
@@ -824,6 +839,7 @@ fn build_output_dependency_graph(
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>(),
+                chunk_contains_cjs_module(chunk),
             )),
             Output::Asset(_) => None,
         })
@@ -831,7 +847,11 @@ fn build_output_dependency_graph(
 
     let output_files = chunks
         .iter()
-        .map(|(filename, _, _)| filename.clone())
+        .map(|(filename, _, _, _)| filename.clone())
+        .collect::<Vec<_>>();
+    let chunk_has_cjs = chunks
+        .iter()
+        .map(|(_, _, _, has_cjs)| *has_cjs)
         .collect::<Vec<_>>();
     let output_index = output_files
         .iter()
@@ -841,7 +861,7 @@ fn build_output_dependency_graph(
 
     let mut static_edges = Vec::new();
     let mut dynamic_edges = Vec::new();
-    for (from_filename, imports, dynamic_imports) in chunks {
+    for (from_filename, imports, dynamic_imports, _) in chunks {
         let Some(from_index) = output_index.get(&from_filename).copied() else {
             continue;
         };
@@ -861,7 +881,39 @@ fn build_output_dependency_graph(
         }
     }
 
-    (output_files, static_edges, dynamic_edges)
+    (output_files, static_edges, dynamic_edges, chunk_has_cjs)
+}
+
+/// Whether an output chunk contains at least one CommonJS source module.
+///
+/// CJS source modules are materialized with a `.cjs` extension (see
+/// [`module_filename`]), so a chunk owning such a module forces Rolldown to emit
+/// the CommonJS interop wrappers (`__commonJSMin`, …). When a CJS chunk and an
+/// ESM chunk import each other directly, that immediate cycle reproduces the
+/// CJS↔ESM boundary cycle Node.js rejects at runtime with
+/// `ERR_REQUIRE_CYCLE_MODULE` (see [`is_immediate_cycle`] and
+/// [`cycle_involves_cjs`]).
+fn chunk_contains_cjs_module(chunk: &rolldown_common::OutputChunk) -> bool {
+    chunk
+        .module_ids
+        .iter()
+        .any(|module_id| module_id.as_str().ends_with(".cjs"))
+}
+
+/// Whether any chunk along the given output cycle owns a CommonJS module.
+fn cycle_involves_cjs(cycle: &[usize], chunk_has_cjs: &[bool]) -> bool {
+    cycle
+        .iter()
+        .any(|&index| chunk_has_cjs.get(index).copied().unwrap_or(false))
+}
+
+/// Whether the cycle is *immediate*: exactly two chunks that import each other
+/// directly. [`graph_cycle_checker::find_cycle`] returns the path with the entry
+/// chunk repeated at both ends (e.g. `[a, b, a]`), so an immediate cycle visits
+/// exactly two distinct chunks. Only immediate cycles map to the CJS↔ESM
+/// `ERR_REQUIRE_CYCLE_MODULE` boundary; larger cycles stay reportable.
+fn is_immediate_cycle(cycle: &[usize]) -> bool {
+    cycle.iter().copied().collect::<HashSet<_>>().len() == 2
 }
 
 fn resolve_specifier(importer: &str, specifier: &str) -> String {
@@ -1625,6 +1677,96 @@ fn format_failure_message(
         repl_url = repl_url,
         fixture_command = fixture_command,
     )
+}
+
+#[cfg(test)]
+mod cjs_cycle_tests {
+    use super::{cycle_involves_cjs, graph_cycle_checker, is_immediate_cycle};
+
+    /// Mirror of the runtime guard in [`super::run_case`]: a cycle is ignored only
+    /// when it is immediate *and* involves a CommonJS chunk.
+    fn is_ignored(cycle: &[usize], chunk_has_cjs: &[bool]) -> bool {
+        is_immediate_cycle(cycle) && cycle_involves_cjs(cycle, chunk_has_cjs)
+    }
+
+    /// Output graph reported in
+    /// <https://github.com/sapphi-red/zarara/issues/28#issuecomment-4619019145>:
+    /// `entry-1.js` (index 0) and the `node1` chunk (index 2) directly import each
+    /// other — an immediate cycle. `node1` is a CommonJS entry, so its chunk owns a
+    /// `.cjs` module, reproducing the CJS↔ESM `ERR_REQUIRE_CYCLE_MODULE` boundary.
+    #[test]
+    fn reported_immediate_cjs_cycle_is_ignored() {
+        // 0=entry-1.js, 1=node0 chunk, 2=node1 chunk, 3=node2 chunk
+        let static_edges = vec![(0, 2), (1, 0), (1, 2), (2, 0), (3, 0)];
+        let chunk_has_cjs = vec![false, true, true, false];
+
+        let cycle = graph_cycle_checker::find_cycle(4, &static_edges)
+            .expect("reported output graph is cyclic");
+
+        assert!(
+            is_immediate_cycle(&cycle),
+            "reported cycle {cycle:?} is a two-chunk immediate cycle",
+        );
+        assert!(
+            is_ignored(&cycle, &chunk_has_cjs),
+            "immediate CJS cycle {cycle:?} must be ignored",
+        );
+    }
+
+    /// The same immediate topology with no CommonJS modules is a genuine pure-ESM
+    /// Rolldown output-graph defect and must still be reported.
+    #[test]
+    fn pure_esm_immediate_cycle_is_reported() {
+        let static_edges = vec![(0, 2), (1, 0), (1, 2), (2, 0), (3, 0)];
+        let chunk_has_cjs = vec![false, false, false, false];
+
+        let cycle = graph_cycle_checker::find_cycle(4, &static_edges)
+            .expect("output graph is cyclic");
+
+        assert!(
+            !is_ignored(&cycle, &chunk_has_cjs),
+            "pure-ESM cycle {cycle:?} must not be ignored",
+        );
+    }
+
+    /// A larger (non-immediate) cycle is reportable even when it passes through a
+    /// CommonJS chunk: only immediate CJS↔ESM cycles map to
+    /// `ERR_REQUIRE_CYCLE_MODULE`.
+    #[test]
+    fn larger_cjs_cycle_is_reported() {
+        // Cycle 0 -> 1 -> 2 -> 0 spans three chunks; chunk 1 owns a `.cjs` module.
+        let static_edges = vec![(0, 1), (1, 2), (2, 0)];
+        let chunk_has_cjs = vec![false, true, false];
+
+        let cycle = graph_cycle_checker::find_cycle(3, &static_edges)
+            .expect("output graph is cyclic");
+
+        assert!(
+            !is_immediate_cycle(&cycle),
+            "cycle {cycle:?} spans three chunks and is not immediate",
+        );
+        assert!(
+            !is_ignored(&cycle, &chunk_has_cjs),
+            "non-immediate cycle {cycle:?} must stay reported",
+        );
+    }
+
+    /// A `.cjs`-owning chunk that is not part of the (immediate) cycle must not
+    /// mask a genuine pure-ESM defect.
+    #[test]
+    fn cjs_chunk_outside_cycle_does_not_mask_defect() {
+        // The cycle is 0 -> 1 -> 0; the CJS chunk (index 3) sits outside it.
+        let static_edges = vec![(0, 1), (1, 0), (3, 0)];
+        let chunk_has_cjs = vec![false, false, false, true];
+
+        let cycle = graph_cycle_checker::find_cycle(4, &static_edges)
+            .expect("output graph is cyclic");
+
+        assert!(
+            !is_ignored(&cycle, &chunk_has_cjs),
+            "cycle {cycle:?} avoids the CJS chunk and must stay reported",
+        );
+    }
 }
 
 fn format_named_cycle(cycle: &[usize], names: &[String], fallback_prefix: &str) -> String {
